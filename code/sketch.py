@@ -58,33 +58,78 @@ def dodge_blend(gray: np.ndarray, blurred_inverted: np.ndarray) -> np.ndarray:
         sketch = gray * 255 / (255 - blurred_inverted)
     Use cv2.divide for stability.
     """
-    # ConvertScaleAbs isn't needed if we keep uint8 carefully.
     denom = 255 - blurred_inverted
-    # Avoid divide-by-zero
     denom = np.where(denom == 0, 1, denom).astype(np.uint8)
-
     sketch = cv2.divide(gray, denom, scale=255)
     return sketch
 
 
-def postprocess(sketch: np.ndarray, sharpen: bool = False, threshold: int | None = None) -> np.ndarray:
+def reinforce_edges(gray: np.ndarray, sketch: np.ndarray, strength: float) -> np.ndarray:
+    if strength <= 0:
+        return sketch
+    edges = cv2.Canny(gray, 50, 150)
+    edges = cv2.bitwise_not(edges)
+    enhanced = cv2.multiply(sketch, edges, scale=1 / 255.0)
+    s = float(np.clip(strength, 0.0, 1.0))
+    return cv2.addWeighted(sketch, 1.0 - s, enhanced, s, 0.0)
+
+
+def reinforce_texture(gray: np.ndarray, sketch: np.ndarray, sigma: float, strength: float) -> np.ndarray:
+    if strength <= 0:
+        return sketch
+
+    g = gray.astype(np.float32)
+    base = cv2.GaussianBlur(g, (0, 0), sigmaX=float(sigma), sigmaY=float(sigma))
+    detail = cv2.absdiff(g, base)
+    detail = cv2.normalize(detail, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+    detail = cv2.GaussianBlur(detail, (0, 0), sigmaX=0.6, sigmaY=0.6)
+
+    mask = 255 - detail
+    textured = cv2.multiply(sketch, mask, scale=1 / 255.0)
+
+    s = float(np.clip(strength, 0.0, 1.0))
+    return cv2.addWeighted(sketch, 1.0 - s, textured, s, 0.0)
+
+
+def postprocess(
+    sketch: np.ndarray,
+    sharpen: bool = False,
+    threshold: int | None = None,
+    contrast: float = 1.0,
+    gamma: float = 1.0,
+    darken: int = 0,
+) -> np.ndarray:
     """
     post-processing:
-    - sharpen: simple unsharp masking-like sharpening
-    - threshold: binary threshold to make it more "line art"
+    - contrast: linear contrast (alpha). >1 makes strokes darker.
+    - gamma: gamma correction. <1 darkens mid-tones (more depth).
+    - darken: subtract brightness to deepen strokes (0~80 is typical).
     """
     out = sketch.copy()
 
+    if contrast != 1.0:
+        out = cv2.convertScaleAbs(out, alpha=float(contrast), beta=0)
+
+    if gamma != 1.0:
+        g = float(gamma)
+        if g <= 0:
+            g = 1.0
+        inv_gamma = 1.0 / g
+        table = (np.linspace(0, 1, 256) ** inv_gamma) * 255
+        table = np.clip(table, 0, 255).astype(np.uint8)
+        out = cv2.LUT(out, table)
+
+    if darken > 0:
+        out = cv2.subtract(out, int(darken))
+
     if sharpen:
-        # Simple sharpening kernel
         kernel = np.array([[0, -1, 0],
                            [-1, 5, -1],
                            [0, -1, 0]], dtype=np.float32)
         out = cv2.filter2D(out, ddepth=-1, kernel=kernel)
 
     if threshold is not None:
-        threshold = int(threshold)
-        threshold = max(0, min(255, threshold))
+        threshold = int(np.clip(threshold, 0, 255))
         _, out = cv2.threshold(out, threshold, 255, cv2.THRESH_BINARY)
 
     return out
@@ -96,15 +141,28 @@ def pencil_sketch_from_bgr(
     sigma: float = 0.0,
     sharpen: bool = False,
     threshold: int | None = None,
+    contrast: float = 1.0,
+    gamma: float = 1.0,
+    darken: int = 0,
+    edge_strength: float = 0.0,
+    texture_strength: float = 0.35,
+    detail_sigma: float = 2.0,
 ) -> dict[str, np.ndarray]:
-    """
-    Run full pipeline and return intermediates for reporting/visualization.
-    """
     gray = to_grayscale(bgr)
     inv = invert(gray)
     blur = gaussian_blur(inv, ksize=ksize, sigma=sigma)
     sketch = dodge_blend(gray, blur)
-    sketch_pp = postprocess(sketch, sharpen=sharpen, threshold=threshold)
+    sketch = reinforce_edges(gray, sketch, edge_strength)
+    sketch = reinforce_texture(gray, sketch, sigma=detail_sigma, strength=texture_strength)
+
+    sketch_pp = postprocess(
+        sketch,
+        sharpen=sharpen,
+        threshold=threshold,
+        contrast=contrast,
+        gamma=gamma,
+        darken=darken,
+    )
 
     return {
         "bgr": bgr,
@@ -132,7 +190,6 @@ def show_images(results: dict[str, np.ndarray], max_width: int = 1200) -> None:
     """
     for name, img in results.items():
         vis = img
-        # Resize large images for display
         h, w = vis.shape[:2]
         if w > max_width:
             scale = max_width / w
@@ -151,6 +208,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sigma", type=float, default=0.0, help="Gaussian blur sigma (0 lets OpenCV choose).")
     parser.add_argument("--sharpen", action="store_true", help="Apply optional sharpening.")
     parser.add_argument("--threshold", type=int, default=None, help="Optional threshold (0-255) for line-art style.")
+    parser.add_argument("--contrast", type=float, default=1.0)
+    parser.add_argument("--gamma", type=float, default=1.0)
+    parser.add_argument("--darken", type=int, default=0)
+    parser.add_argument("--edge_strength", type=float, default=0.0)
+    parser.add_argument("--texture_strength", type=float, default=0.35)
+    parser.add_argument("--detail_sigma", type=float, default=2.0)
     parser.add_argument("--show", action="store_true", help="Show intermediate results in windows.")
     return parser.parse_args()
 
@@ -165,6 +228,12 @@ def main() -> None:
         sigma=args.sigma,
         sharpen=args.sharpen,
         threshold=args.threshold,
+        contrast=args.contrast,
+        gamma=args.gamma,
+        darken=args.darken,
+        edge_strength=args.edge_strength,
+        texture_strength=args.texture_strength,
+        detail_sigma=args.detail_sigma,
     )
 
     save_image(args.output, results["sketch_final"])
